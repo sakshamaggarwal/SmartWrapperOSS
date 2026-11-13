@@ -35,6 +35,7 @@ from core.model_router import ModelResponse  # noqa: E402
 from workflows.guidance_extraction.evaluator import GuidanceExtractionEvaluator  # noqa: E402
 from workflows.guidance_extraction.runner_autogen import GuidanceAutoGenRunner  # noqa: E402
 from workflows.guidance_extraction.runner_langgraph import GuidanceLangGraphRunner  # noqa: E402
+from workflows.guidance_extraction.runner_ensemble import GuidanceEnsembleRunner  # noqa: E402
 from workflows.guidance_extraction.task import load_task  # noqa: E402
 
 TASK = "benchmarks/guidance_extraction/northwind_q2_q3_fy2026.yaml"
@@ -86,7 +87,11 @@ class ScriptedRouter:
 
 
 def run_case(name, router, task):
-    runners = {"autogen": GuidanceAutoGenRunner(router), "langgraph": GuidanceLangGraphRunner(router)}
+    runners = {
+        "autogen": GuidanceAutoGenRunner(router),
+        "langgraph": GuidanceLangGraphRunner(router),
+        "ensemble": GuidanceEnsembleRunner(router, num_agents=5),
+    }
     results = [(fw, "fake-model", r.run("fake-model", task)) for fw, r in runners.items()]
     scored = GuidanceExtractionEvaluator().score_all(results, task)
     print(f"\n== {name} ==")

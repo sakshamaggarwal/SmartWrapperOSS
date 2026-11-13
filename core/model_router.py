@@ -48,9 +48,14 @@ class ModelResponse:
 # `cost_per_1k_input` / `cost_per_1k_output` directly in config.yaml
 # instead of being added here — see config/config.yaml.example.
 COST_PER_1K_TOKENS = {
-    "gpt-4o":            {"input": 0.0025,  "output": 0.010},
-    "claude-sonnet-4-6": {"input": 0.003,  "output": 0.015},
-    "gemini-3.5-flash":  {"input": 0.0015, "output": 0.009},
+    "gpt-4o":            {"input": 0.0025,   "output": 0.010},
+    "gpt-4o-mini":       {"input": 0.00015,  "output": 0.0006},
+    "claude-sonnet-4-6": {"input": 0.003,    "output": 0.015},
+    "gemini-3.5-flash":  {"input": 0.0015,   "output": 0.009},
+    "muse-ember":        {"input": 0.0001,   "output": 0.0005},
+    "muse-glimmer-30b":  {"input": 0.0003,   "output": 0.0012},
+    "muse-spark-1.3":    {"input": 0.00125,  "output": 0.00425},
+    "muse-wonder":       {"input": 0.0040,   "output": 0.0200},
 }
 
 
@@ -175,10 +180,10 @@ class ModelRouter:
         format. This single adapter covers local runtimes (Ollama's `/v1`
         endpoint, vLLM, LM Studio, llama.cpp server, text-generation-webui)
         AND hosted OSS-model APIs (Together, Groq, Fireworks, OpenRouter) —
-        so Llama, Mistral, Qwen, DeepSeek, etc. are all just a config.yaml
-        entry away, not a new adapter.
+        so Llama, Mistral, Qwen, DeepSeek, Muse, etc. are all just a
+        config.yaml entry away, not a new adapter.
         """
-        import openai
+        import os
 
         base_url = config.get("base_url")
         if not base_url:
@@ -187,50 +192,93 @@ class ModelRouter:
                 f"'base_url' in config.yaml. Point it at the endpoint's "
                 f"OpenAI-compatible root, e.g. 'http://localhost:11434/v1' "
                 f"(Ollama), 'http://localhost:8000/v1' (vLLM / LM Studio), "
-                f"or 'https://api.together.xyz/v1' (Together)."
+                f"or 'https://openrouter.ai/api/v1' (OpenRouter)."
             )
 
-        # Most local runtimes don't check the API key at all; hosted APIs
-        # (Together, Groq, OpenRouter, ...) require a real one. The
-        # placeholder keeps the OpenAI client happy either way.
-        client = openai.OpenAI(
-            api_key=config.get("api_key", "not-needed"),
-            base_url=base_url,
-            # Local models — especially larger ones running on modest
-            # hardware — can be far slower to a first token than a cloud
-            # API. Default higher than the SDK's own default so a slow
-            # local model doesn't get cut off mid-generation; still
-            # overridable per-model via `timeout` in config.yaml.
-            timeout=config.get("timeout", 120),
-        )
+        raw_key = config.get("api_key", "not-needed")
+        if isinstance(raw_key, str) and raw_key.startswith("$"):
+            api_key = os.environ.get(raw_key[1:], "not-needed")
+        elif config.get("api_key_env"):
+            api_key = os.environ.get(config["api_key_env"], raw_key)
+        else:
+            api_key = raw_key
 
-        # The friendly `id` used elsewhere in SmartWrapperOSS (CLI
-        # --models, cost table, results.json) doesn't have to match what
-        # the endpoint expects on the wire. Set `api_model` in
-        # config.yaml when they differ, e.g. id: llama-3.3-70b,
-        # api_model: "llama3.3:70b".
         api_model = config.get("api_model", model_id)
-
-        # Some runtimes accept extra request-body fields beyond the OpenAI
-        # spec (e.g. Ollama's `keep_alive`, controlling how long it keeps
-        # the model loaded in memory between calls). `extra_params` in
-        # config.yaml is passed straight through; unrecognized fields are
-        # simply ignored by runtimes that don't support them.
         extra_params = config.get("extra_params", {})
+        timeout = config.get("timeout", 120)
+        max_tokens = config.get("max_tokens")
+
+        try:
+            import openai
+        except ModuleNotFoundError:
+            openai = None
+
+        if openai is None:
+            import json
+            import urllib.error
+            import urllib.request
+
+            url = base_url.rstrip("/") + "/chat/completions"
+            body = {
+                "model": api_model,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if max_tokens is not None:
+                body["max_tokens"] = max_tokens
+            if extra_params:
+                body.update(extra_params)
+
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            start = time.time()
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                err_body = e.read().decode("utf-8", errors="replace")[:500]
+                raise RuntimeError(f"HTTP {e.code} from {url}: {err_body}") from e
+            except urllib.error.URLError as e:
+                raise ConnectionError(f"Could not reach '{model_id}' at {base_url}: {e}") from e
+            latency_ms = (time.time() - start) * 1000
+
+            if data.get("error"):
+                raise RuntimeError(f"API error from {url}: {json.dumps(data['error'])[:500]}")
+
+            text = data["choices"][0]["message"].get("content") or ""
+            usage = data.get("usage") or {}
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            cost = self._calc_cost(model_id, input_tokens, output_tokens, config)
+            return ModelResponse(
+                model_id=model_id,
+                text=text,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+                cost_usd=cost,
+            )
+
+        client = openai.OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+        )
 
         start = time.time()
         try:
             resp = client.chat.completions.create(
                 model=api_model,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=config.get("max_tokens", 1000),
+                max_tokens=max_tokens,
                 extra_body=extra_params if extra_params else None,
             )
         except openai.APIConnectionError as e:
-            # This is the failure mode people actually hit with local
-            # models: the runtime just isn't up yet. Give a hint tailored
-            # to the common case (Ollama on its default port) and a
-            # generic one otherwise, instead of a raw connection traceback.
             if ":11434" in base_url:
                 hint = (
                     f"Is Ollama running? Try `ollama serve`, and make sure "
@@ -244,14 +292,12 @@ class ModelRouter:
         except openai.APITimeoutError as e:
             raise TimeoutError(
                 f"Call to '{model_id}' at {base_url} timed out after "
-                f"{config.get('timeout', 120)}s. Local models on modest "
+                f"{timeout}s. Local models on modest "
                 f"hardware can be slow — try raising `timeout` in "
                 f"config.yaml for this model."
             ) from e
         latency_ms = (time.time() - start) * 1000
 
-        # Some local runtimes omit usage stats on certain configurations;
-        # degrade to 0 rather than crashing an otherwise-successful run.
         usage = resp.usage
         input_tokens = usage.prompt_tokens if usage else 0
         output_tokens = usage.completion_tokens if usage else 0
